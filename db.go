@@ -692,7 +692,14 @@ func (db *DB) loadIndexFromWAL() error {
 
 		chunk, position, err := reader.Next()
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			// A CRC mismatch can only come from a partially written record at the
+			// tail of a segment, left by a crash mid-write. Everything before it
+			// is checksum-valid and has already been replayed, so stop recovery
+			// here instead of failing to open the whole database.
+			if errors.Is(err, wal.ErrInvalidCRC) {
 				break
 			}
 			return err
