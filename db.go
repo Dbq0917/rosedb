@@ -744,17 +744,27 @@ func (db *DB) loadIndexFromWAL() error {
 // DeleteExpiredKeys scan the entire index in ascending order to delete expired keys.
 // It is a time-consuming operation, so we need to specify a timeout
 // to prevent the DB from being unavailable for a long time.
+//
+// The expired keys are removed from the in-memory index first. If any expired
+// key was found and the scan finished within the timeout, a merge is triggered
+// to rewrite the data files without the expired records, so that the disk space
+// occupied by them is actually reclaimed.
 func (db *DB) DeleteExpiredKeys(timeout time.Duration) error {
 	// set timeout
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	// use channel to pass error safely without race condition
-	errCh := make(chan error, 1)
+	// use channel to pass the scan result safely without race condition
+	type scanResult struct {
+		deleted int
+		err     error
+	}
+	resultCh := make(chan scanResult, 1)
 
 	now := time.Now().UnixNano()
 	go func() {
 		db.mu.Lock()
 		defer db.mu.Unlock()
+		deleted := 0
 		for {
 			// select 100 keys from the db.index
 			positions := make([]*wal.ChunkPosition, 0, 100)
@@ -769,7 +779,7 @@ func (db *DB) DeleteExpiredKeys(timeout time.Duration) error {
 			// If keys in the db.index has been traversed, len(positions) will be 0.
 			if len(positions) == 0 {
 				db.expiredCursorKey = nil
-				errCh <- nil
+				resultCh <- scanResult{deleted: deleted}
 				return
 			}
 
@@ -777,12 +787,13 @@ func (db *DB) DeleteExpiredKeys(timeout time.Duration) error {
 			for _, pos := range positions {
 				chunk, err := db.dataFiles.Read(pos)
 				if err != nil {
-					errCh <- err
+					resultCh <- scanResult{err: err}
 					return
 				}
 				record := decodeLogRecord(chunk)
 				if record.IsExpired(now) {
 					db.index.Delete(record.Key)
+					deleted++
 				}
 				db.expiredCursorKey = record.Key
 			}
@@ -794,7 +805,17 @@ func (db *DB) DeleteExpiredKeys(timeout time.Duration) error {
 		// Timeout occurred, return nil as this is expected behavior.
 		// The goroutine will continue running in background until completion.
 		return nil
-	case err := <-errCh:
-		return err
+	case result := <-resultCh:
+		if result.err != nil {
+			return result.err
+		}
+		// The expired keys were only removed from the in-memory index, their
+		// records still occupy disk space in the WAL segment files.
+		// Merge rewrites the data files without those records and rebuilds
+		// the index, so the disk space is reclaimed.
+		if result.deleted > 0 {
+			return db.Merge(true)
+		}
+		return nil
 	}
 }

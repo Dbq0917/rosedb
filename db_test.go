@@ -756,12 +756,20 @@ func TestDB_DeleteExpiredKeys(t *testing.T) {
 		assert.NoError(t, err)
 	}
 
+	// all the keys are still in the database, and occupy disk space
+	sizeBefore := db.Stat().DiskSize
+	assert.Greater(t, sizeBefore, int64(0))
+
 	// wait for key to expire
 	time.Sleep(time.Second * 2)
 
 	err = db.DeleteExpiredKeys(time.Second * 2)
 	assert.NoError(t, err)
 	assert.Equal(t, 0, db.Stat().KeysNum)
+
+	// the disk space occupied by the expired keys should be reclaimed
+	sizeAfter := db.Stat().DiskSize
+	assert.Less(t, sizeAfter, sizeBefore)
 }
 
 func TestDB_Multi_DeleteExpiredKeys(t *testing.T) {
