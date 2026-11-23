@@ -30,6 +30,17 @@ const (
 // If reopenAfterDone is true, the original file will be replaced by the merge file,
 // and db's index will be rebuilt after the merge completes.
 func (db *DB) Merge(reopenAfterDone bool) error {
+	// Only one merge operation can run at a time, and the flag must
+	// cover the whole operation, including replacing the data files
+	// and rebuilding the index below. Otherwise a second merge can
+	// start while the first one is still installing its result, and
+	// they will destroy each other's merge directory, which may
+	// delete live segment files and lose data.
+	if !atomic.CompareAndSwapUint32(&db.mergeRunning, 0, 1) {
+		return ErrMergeRunning
+	}
+	defer atomic.StoreUint32(&db.mergeRunning, 0)
+
 	if err := db.doMerge(); err != nil {
 		return err
 	}
@@ -76,15 +87,6 @@ func (db *DB) doMerge() error {
 		db.mu.Unlock()
 		return nil
 	}
-	// check if the merge operation is running
-	if atomic.LoadUint32(&db.mergeRunning) == 1 {
-		db.mu.Unlock()
-		return ErrMergeRunning
-	}
-	// set the mergeRunning flag to true
-	atomic.StoreUint32(&db.mergeRunning, 1)
-	// set the mergeRunning flag to false when the merge operation is completed
-	defer atomic.StoreUint32(&db.mergeRunning, 0)
 
 	prevActiveSegId := db.dataFiles.ActiveSegmentID()
 	// rotate the write-ahead log, create a new active segment file.
@@ -183,6 +185,10 @@ func (db *DB) openMergeDB() (*DB, error) {
 	// because we can sync the data file manually after the merge operation is completed.
 	options.Sync, options.BytesPerSync = false, 0
 	options.DirPath = mergePath
+	// the merge db is temporary and must never schedule its own auto merge,
+	// otherwise the cron task may rewrite the merge directory while the
+	// outer merge is still writing to it, corrupting the merge result.
+	options.AutoMergeCronExpr = ""
 	mergeDB, err := Open(options)
 	if err != nil {
 		return nil, err
@@ -264,6 +270,11 @@ func loadMergeFiles(dirPath string) error {
 	mergeFinSegmentId, err := getMergeFinSegmentId(mergeDirPath)
 	if err != nil {
 		return err
+	}
+	// the merge operation is not completed, the merge directory only
+	// contains partial data, just discard it and return.
+	if mergeFinSegmentId == 0 {
+		return nil
 	}
 	// now we get the merge finished segment id, so all the segment id less than the merge finished segment id
 	// should be moved to the original data directory, and the original data files should be deleted.

@@ -1,10 +1,12 @@
 package rosedb
 
 import (
+	"fmt"
 	"math/rand"
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/rosedblabs/rosedb/v2/utils"
 	"github.com/stretchr/testify/assert"
@@ -302,4 +304,68 @@ func TestDB_Merge_Concurrent_Put(t *testing.T) {
 		return true
 	})
 	assert.Equal(t, count, db.index.Size())
+}
+
+// TestDB_AutoMerge_Concurrent_Put enables the auto merge cron task and keeps
+// writing while merges are running, all the written data must be preserved.
+func TestDB_AutoMerge_Concurrent_Put(t *testing.T) {
+	options := DefaultOptions
+	options.DirPath = t.TempDir()
+	// merge every second to trigger merges frequently during the writes
+	options.AutoMergeCronExpr = "*/1 * * * * *"
+	db, err := Open(options)
+	require.NoError(t, err)
+
+	wg := sync.WaitGroup{}
+	m := sync.Map{}
+	// preload some data so a merge takes a little while
+	for i := 0; i < 20000; i++ {
+		key := utils.GetTestKey(i)
+		value := utils.RandomValue(128)
+		require.NoError(t, db.Put(key, value))
+		m.Store(string(key), value)
+	}
+
+	stop := make(chan struct{})
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				key := []byte(fmt.Sprintf("key-%d-%d", id, i))
+				value := utils.RandomValue(64)
+				if err := db.Put(key, value); err != nil {
+					return
+				}
+				m.Store(string(key), value)
+			}
+		}(i)
+	}
+
+	// let the auto merge task run several times during the writes
+	time.Sleep(8 * time.Second)
+	close(stop)
+	wg.Wait()
+	require.NoError(t, db.Close())
+
+	// reopen the db and check all the written data
+	options.AutoMergeCronExpr = ""
+	db2, err := Open(options)
+	require.NoError(t, err)
+	defer destroyDB(db2)
+
+	var count int
+	m.Range(func(key, value any) bool {
+		v, err := db2.Get([]byte(key.(string)))
+		assert.NoError(t, err)
+		assert.Equal(t, value.([]byte), v)
+		count++
+		return true
+	})
+	assert.Equal(t, count, db2.index.Size())
 }
