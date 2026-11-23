@@ -295,6 +295,25 @@ func (db *DB) PutWithTTL(key, value []byte, ttl time.Duration) error {
 	return batch.Commit()
 }
 
+// PutWithType writes a key-value pair and fixes the key's data type.
+//
+// Once a key has a concrete type, subsequent writes must use the same type.
+// Untyped records created by older versions can be claimed by the first typed
+// write, so upgrading does not require rewriting the existing database.
+func (db *DB) PutWithType(key, value []byte, dataType DataType) error {
+	batch := db.batchPool.Get().(*Batch)
+	defer func() {
+		batch.reset()
+		db.batchPool.Put(batch)
+	}()
+	batch.init(false, false, db)
+	if err := batch.PutWithType(key, value, dataType); err != nil {
+		_ = batch.Rollback()
+		return err
+	}
+	return batch.Commit()
+}
+
 // Get the value of the specified key from the database.
 // Actually, it will open a new batch and commit it.
 // You can think the batch has only one Get operation.
@@ -307,6 +326,48 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 		db.batchPool.Put(batch)
 	}()
 	return batch.Get(key)
+}
+
+// GetWithType returns a value only when the key holds dataType.
+// Legacy untyped records remain readable.
+func (db *DB) GetWithType(key []byte, dataType DataType) ([]byte, error) {
+	batch := db.batchPool.Get().(*Batch)
+	batch.init(true, false, db)
+	defer func() {
+		_ = batch.Commit()
+		batch.reset()
+		db.batchPool.Put(batch)
+	}()
+	return batch.GetWithType(key, dataType)
+}
+
+// GetDataType returns the data type bound to a key.
+func (db *DB) GetDataType(key []byte) (DataType, error) {
+	batch := db.batchPool.Get().(*Batch)
+	batch.init(true, false, db)
+	defer func() {
+		_ = batch.Commit()
+		batch.reset()
+		db.batchPool.Put(batch)
+	}()
+	return batch.GetDataType(key)
+}
+
+// SetDataType binds a legacy untyped or generic-bytes record to dataType
+// without changing its value. It returns ErrWrongType when the key already has
+// a typed value.
+func (db *DB) SetDataType(key []byte, dataType DataType) error {
+	batch := db.batchPool.Get().(*Batch)
+	defer func() {
+		batch.reset()
+		db.batchPool.Put(batch)
+	}()
+	batch.init(false, false, db)
+	if err := batch.SetDataType(key, dataType); err != nil {
+		_ = batch.Rollback()
+		return err
+	}
+	return batch.Commit()
 }
 
 // Delete the specified key from the database.

@@ -117,6 +117,19 @@ func (b *Batch) unlock() {
 
 // Put adds a key-value pair to the batch for writing.
 func (b *Batch) Put(key, value []byte) error {
+	return b.put(key, value, 0, DataTypeUntyped, false)
+}
+
+// PutWithType adds a key-value pair and binds the key to dataType.
+//
+// A key may only be written with the type it was created with. Records
+// written by older versions are untyped and can be claimed by the first typed
+// write, so existing databases remain readable.
+func (b *Batch) PutWithType(key, value []byte, dataType DataType) error {
+	return b.put(key, value, 0, dataType, true)
+}
+
+func (b *Batch) put(key, value []byte, expire int64, dataType DataType, typed bool) error {
 	if len(key) == 0 {
 		return ErrKeyIsEmpty
 	}
@@ -126,10 +139,35 @@ func (b *Batch) Put(key, value []byte) error {
 	if b.options.ReadOnly {
 		return ErrReadOnlyBatch
 	}
+	if typed && (dataType == DataTypeUntyped || !dataType.valid()) {
+		return ErrInvalidDataType
+	}
 
 	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	// write to pendingWrites
 	record := b.lookupPendingWrites(key)
+	currentType, exists, err := b.keyDataType(key, record)
+	if err != nil {
+		return err
+	}
+
+	var recordType DataType
+	if typed {
+		if exists && currentType != DataTypeUntyped && currentType != dataType {
+			return fmt.Errorf("%w: key %q is %s, expected %s", ErrWrongType, key, currentType, dataType)
+		}
+		recordType = dataType
+	} else if exists {
+		if currentType == DataTypeList || currentType == DataTypeHash {
+			return fmt.Errorf("%w: key %q is %s, use a typed write", ErrWrongType, key, currentType)
+		}
+		recordType = currentType
+	} else {
+		recordType = DataTypeBytes
+	}
+
 	if record == nil {
 		// if the key does not exist in pendingWrites, write a new record
 		// the record will be put back to the pool when the batch is committed or rollbacked
@@ -138,43 +176,31 @@ func (b *Batch) Put(key, value []byte) error {
 	}
 
 	record.Key, record.Value = key, value
-	record.Type, record.Expire = LogRecordNormal, 0
-	b.mu.Unlock()
+	record.Type, record.DataType, record.Expire = LogRecordNormal, recordType, expire
 
 	return nil
 }
 
 // PutWithTTL adds a key-value pair with ttl to the batch for writing.
 func (b *Batch) PutWithTTL(key, value []byte, ttl time.Duration) error {
-	if len(key) == 0 {
-		return ErrKeyIsEmpty
-	}
-	if b.db.closed {
-		return ErrDBClosed
-	}
-	if b.options.ReadOnly {
-		return ErrReadOnlyBatch
-	}
-
-	b.mu.Lock()
-	// write to pendingWrites
-	record := b.lookupPendingWrites(key)
-	if record == nil {
-		// if the key does not exist in pendingWrites, write a new record
-		// the record will be put back to the pool when the batch is committed or rollbacked
-		record = b.db.recordPool.Get().(*LogRecord)
-		b.appendPendingWrites(key, record)
-	}
-
-	record.Key, record.Value = key, value
-	record.Type, record.Expire = LogRecordNormal, time.Now().Add(ttl).UnixNano()
-	b.mu.Unlock()
-
-	return nil
+	return b.put(key, value, time.Now().Add(ttl).UnixNano(), DataTypeUntyped, false)
 }
 
 // Get retrieves the value associated with a given key from the batch.
 func (b *Batch) Get(key []byte) ([]byte, error) {
+	return b.get(key, DataTypeUntyped)
+}
+
+// GetWithType retrieves a value only when the key holds dataType. Legacy
+// untyped records remain readable and are not rejected.
+func (b *Batch) GetWithType(key []byte, dataType DataType) ([]byte, error) {
+	if !dataType.valid() {
+		return nil, ErrInvalidDataType
+	}
+	return b.get(key, dataType)
+}
+
+func (b *Batch) get(key []byte, expectedType DataType) ([]byte, error) {
 	if len(key) == 0 {
 		return nil, ErrKeyIsEmpty
 	}
@@ -192,6 +218,9 @@ func (b *Batch) Get(key []byte) ([]byte, error) {
 	if record != nil {
 		if record.Type == LogRecordDeleted || record.IsExpired(now) {
 			return nil, ErrKeyNotFound
+		}
+		if err := checkDataType(key, record.DataType, expectedType); err != nil {
+			return nil, err
 		}
 		return record.Value, nil
 	}
@@ -215,7 +244,143 @@ func (b *Batch) Get(key []byte) ([]byte, error) {
 		b.db.index.Delete(record.Key)
 		return nil, ErrKeyNotFound
 	}
+	if err := checkDataType(key, record.DataType, expectedType); err != nil {
+		return nil, err
+	}
 	return record.Value, nil
+}
+
+// GetDataType returns the logical type bound to a key. Untyped is returned for
+// records created by older versions.
+func (b *Batch) GetDataType(key []byte) (DataType, error) {
+	if len(key) == 0 {
+		return DataTypeUntyped, ErrKeyIsEmpty
+	}
+	if b.db.closed {
+		return DataTypeUntyped, ErrDBClosed
+	}
+
+	b.mu.RLock()
+	record := b.lookupPendingWrites(key)
+	b.mu.RUnlock()
+	if record != nil {
+		if record.Type == LogRecordDeleted || record.IsExpired(time.Now().UnixNano()) {
+			return DataTypeUntyped, ErrKeyNotFound
+		}
+		return record.DataType, nil
+	}
+
+	position := b.db.index.Get(key)
+	if position == nil {
+		return DataTypeUntyped, ErrKeyNotFound
+	}
+	chunk, err := b.db.dataFiles.Read(position)
+	if err != nil {
+		return DataTypeUntyped, err
+	}
+	record = decodeLogRecord(chunk)
+	if record.Type == LogRecordDeleted || record.IsExpired(time.Now().UnixNano()) {
+		return DataTypeUntyped, ErrKeyNotFound
+	}
+	return record.DataType, nil
+}
+
+// SetDataType binds an existing legacy or generic-bytes record to dataType
+// without changing its value. A key that already has a typed value cannot be
+// converted.
+func (b *Batch) SetDataType(key []byte, dataType DataType) error {
+	if len(key) == 0 {
+		return ErrKeyIsEmpty
+	}
+	if b.db.closed {
+		return ErrDBClosed
+	}
+	if b.options.ReadOnly {
+		return ErrReadOnlyBatch
+	}
+	if dataType == DataTypeUntyped || !dataType.valid() {
+		return ErrInvalidDataType
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	record := b.lookupPendingWrites(key)
+	if record != nil {
+		if record.Type == LogRecordDeleted || record.IsExpired(time.Now().UnixNano()) {
+			return ErrKeyNotFound
+		}
+		return setRecordDataType(key, record, dataType)
+	}
+
+	position := b.db.index.Get(key)
+	if position == nil {
+		return ErrKeyNotFound
+	}
+	chunk, err := b.db.dataFiles.Read(position)
+	if err != nil {
+		return err
+	}
+	record = decodeLogRecord(chunk)
+	if record.Type == LogRecordDeleted || record.IsExpired(time.Now().UnixNano()) {
+		b.db.index.Delete(key)
+		return ErrKeyNotFound
+	}
+	if err = setRecordDataType(key, record, dataType); err != nil {
+		return err
+	}
+	if record.Type == LogRecordNormal {
+		b.appendPendingWrites(key, record)
+	}
+	return nil
+}
+
+func (b *Batch) keyDataType(key []byte, pending *LogRecord) (DataType, bool, error) {
+	now := time.Now().UnixNano()
+	if pending != nil {
+		if pending.Type == LogRecordDeleted || pending.IsExpired(now) {
+			return DataTypeUntyped, false, nil
+		}
+		if !pending.DataType.valid() {
+			return DataTypeUntyped, false, ErrInvalidDataType
+		}
+		return pending.DataType, true, nil
+	}
+
+	position := b.db.index.Get(key)
+	if position == nil {
+		return DataTypeUntyped, false, nil
+	}
+	chunk, err := b.db.dataFiles.Read(position)
+	if err != nil {
+		return DataTypeUntyped, false, err
+	}
+	record := decodeLogRecord(chunk)
+	if record.Type == LogRecordDeleted || record.IsExpired(now) {
+		return DataTypeUntyped, false, nil
+	}
+	if !record.DataType.valid() {
+		return DataTypeUntyped, false, ErrInvalidDataType
+	}
+	return record.DataType, true, nil
+}
+
+func checkDataType(key []byte, actual, expected DataType) error {
+	if expected == DataTypeUntyped || actual == DataTypeUntyped || actual == expected {
+		return nil
+	}
+	return fmt.Errorf("%w: key %q is %s, expected %s", ErrWrongType, key, actual, expected)
+}
+
+func setRecordDataType(key []byte, record *LogRecord, dataType DataType) error {
+	if record.DataType == dataType {
+		return nil
+	}
+	if record.DataType != DataTypeUntyped && record.DataType != DataTypeBytes {
+		return fmt.Errorf("%w: key %q is %s, cannot change to %s", ErrWrongType, key, record.DataType, dataType)
+	}
+	record.DataType = dataType
+	return nil
 }
 
 // Delete marks a key for deletion in the batch.

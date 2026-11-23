@@ -12,4 +12,6 @@ var (
 	ErrDBClosed        = errors.New("the database is closed")
 	ErrMergeRunning    = errors.New("the merge operation is running")
 	ErrWatchDisabled   = errors.New("the watch is disabled")
+	ErrWrongType       = errors.New("the key holds a value of a different data type")
+	ErrInvalidDataType = errors.New("invalid data type")
 )

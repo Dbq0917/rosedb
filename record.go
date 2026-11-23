@@ -19,6 +19,41 @@ const (
 	LogRecordBatchFinished
 )
 
+const logRecordTypeMask = LogRecordType(0x03)
+
+// DataType identifies the logical type of the value stored under a key.
+//
+// DataTypeUntyped is reserved for records written by older versions. It is
+// readable but can be claimed by the first typed write without rewriting the
+// rest of the database.
+type DataType byte
+
+const (
+	DataTypeUntyped DataType = iota
+	DataTypeBytes
+	DataTypeList
+	DataTypeHash
+)
+
+func (t DataType) String() string {
+	switch t {
+	case DataTypeUntyped:
+		return "untyped"
+	case DataTypeBytes:
+		return "bytes"
+	case DataTypeList:
+		return "list"
+	case DataTypeHash:
+		return "hash"
+	default:
+		return "unknown"
+	}
+}
+
+func (t DataType) valid() bool {
+	return t <= DataTypeHash
+}
+
 // type batchId keySize valueSize expire
 //
 //	1  +  10  +   5   +   5   +    10  = 31
@@ -28,11 +63,12 @@ const maxLogRecordHeaderSize = binary.MaxVarintLen32*2 + binary.MaxVarintLen64*2
 // It contains the key, the value, the record type and the batch id
 // It will be encoded to byte slice and written to the wal.
 type LogRecord struct {
-	Key     []byte
-	Value   []byte
-	Type    LogRecordType
-	BatchId uint64
-	Expire  int64
+	Key      []byte
+	Value    []byte
+	Type     LogRecordType
+	DataType DataType
+	BatchId  uint64
+	Expire   int64
 }
 
 // IsExpired checks whether the log record is expired.
@@ -49,13 +85,17 @@ type IndexRecord struct {
 	position   *wal.ChunkPosition
 }
 
-// +-------------+-------------+-------------+--------------+---------------+---------+--------------+
-// |    type     |  batch id   |   key size  |   value size |     expire    |  key    |      value   |
-// +-------------+-------------+-------------+--------------+---------------+--------+--------------+
+// +------------------+-------------+-------------+--------------+---------------+---------+--------------+
+// | record/data type |  batch id   |   key size  |   value size |     expire    |  key    |      value   |
+// +------------------+-------------+-------------+--------------+---------------+--------+--------------+
 //
-//	1 byte	      varint(max 10) varint(max 5)  varint(max 5) varint(max 10)  varint      varint
+//	1 byte	         varint(max 10) varint(max 5)  varint(max 5) varint(max 10)  varint      varint
+//
+// The first byte packs the two-bit log record type in the low bits and the data
+// type in the remaining six bits. Older records have zero in the data type
+// bits, so they decode as DataTypeUntyped without a format migration.
 func encodeLogRecord(logRecord *LogRecord, header []byte, buf *bytebufferpool.ByteBuffer) []byte {
-	header[0] = logRecord.Type
+	header[0] = logRecord.Type&logRecordTypeMask | byte(logRecord.DataType)<<2
 	index := 1
 
 	// batch id
@@ -79,7 +119,8 @@ func encodeLogRecord(logRecord *LogRecord, header []byte, buf *bytebufferpool.By
 
 // decodeLogRecord decodes the log record from the given byte slice.
 func decodeLogRecord(buf []byte) *LogRecord {
-	recordType := buf[0]
+	recordType := buf[0] & logRecordTypeMask
+	dataType := DataType(buf[0] >> 2)
 
 	var index uint32 = 1
 	// batch id
@@ -109,7 +150,7 @@ func decodeLogRecord(buf []byte) *LogRecord {
 
 	return &LogRecord{
 		Key: key, Value: value, Expire: expire,
-		BatchId: batchId, Type: recordType,
+		BatchId: batchId, Type: recordType, DataType: dataType,
 	}
 }
 
