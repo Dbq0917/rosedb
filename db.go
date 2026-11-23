@@ -681,6 +681,9 @@ func (db *DB) loadIndexFromWAL() error {
 	// get a reader for WAL
 	reader := db.dataFiles.NewReader()
 	db.dataFiles.SetIsStartupTraversal(true)
+	// indicates whether the active segment has a torn tail, which happens
+	// when the process is killed in the middle of writing a segment.
+	tornActiveSegment := false
 	for {
 		// if the current segment id is less than the mergeFinSegmentId,
 		// we can skip this segment because it has been merged,
@@ -694,6 +697,19 @@ func (db *DB) loadIndexFromWAL() error {
 		if err != nil {
 			if err == io.EOF {
 				break
+			}
+			if errors.Is(err, wal.ErrInvalidCRC) {
+				// A torn write (e.g. the process was killed while writing
+				// a segment) leaves a corrupted chunk at the tail of the
+				// segment. Keep the valid records already read from it and
+				// skip only the unreadable remainder, instead of failing
+				// the whole recovery or discarding the entire segment.
+				if reader.CurrentSegmentId() >= db.dataFiles.ActiveSegmentID() {
+					tornActiveSegment = true
+					break
+				}
+				reader.SkipCurrentSegment()
+				continue
 			}
 			return err
 		}
@@ -738,6 +754,15 @@ func (db *DB) loadIndexFromWAL() error {
 		}
 	}
 	db.dataFiles.SetIsStartupTraversal(false)
+	if tornActiveSegment {
+		// The active segment ends with a corrupted tail. New writes must not
+		// be appended after it, otherwise the corrupted chunk would sit in the
+		// middle of the segment and the valid data behind it would be skipped
+		// on the next recovery. Rotate to a fresh segment instead.
+		if err := db.dataFiles.OpenNewActiveSegment(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

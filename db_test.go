@@ -5,6 +5,8 @@ import (
 	"io"
 	"math/rand"
 	"os"
+	"path/filepath"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -1193,6 +1195,65 @@ func TestDB_Reopen_With_Data(t *testing.T) {
 	}
 	for i := 500; i < 1000; i++ {
 		val, err := db2.Get(utils.GetTestKey(i))
+		assert.NoError(t, err)
+		assert.NotNil(t, val)
+	}
+}
+
+func TestDB_Recover_Torn_Segment(t *testing.T) {
+	options := DefaultOptions
+	options.SegmentSize = 64 * KB
+	db, err := Open(options)
+	assert.NoError(t, err)
+
+	// write enough data to span multiple segment files
+	const keyNum = 2000
+	for i := 0; i < keyNum; i++ {
+		err := db.Put(utils.GetTestKey(i), utils.RandomValue(100))
+		assert.NoError(t, err)
+	}
+	assert.NoError(t, db.Close())
+
+	// simulate kill -9 in the middle of writing a segment:
+	// the active segment file ends with a half-written chunk.
+	segFiles, err := filepath.Glob(filepath.Join(options.DirPath, "*"+dataFileNameSuffix))
+	assert.NoError(t, err)
+	require.NotEmpty(t, segFiles)
+	sort.Strings(segFiles)
+	tornSeg := segFiles[len(segFiles)-1]
+	f, err := os.OpenFile(tornSeg, os.O_WRONLY|os.O_APPEND, 0o644)
+	assert.NoError(t, err)
+	// a partial chunk: a complete-looking header followed by a truncated payload
+	torn := append([]byte{0xDE, 0xAD, 0xBE, 0xEF, 0x40, 0x00, 0x01}, utils.RandomValue(20)...)
+	_, err = f.Write(torn)
+	assert.NoError(t, err)
+	assert.NoError(t, f.Close())
+
+	// recovery must succeed and keep every key, including the ones
+	// stored in the valid prefix of the torn segment.
+	db2, err := Open(options)
+	assert.NoError(t, err)
+	assert.Equal(t, keyNum, db2.Stat().KeysNum)
+	for i := 0; i < keyNum; i++ {
+		val, err := db2.Get(utils.GetTestKey(i))
+		assert.NoError(t, err)
+		assert.NotNil(t, val)
+	}
+
+	// new writes after recovery must survive the next restart as well,
+	// they must not be appended after the corrupted tail.
+	for i := keyNum; i < keyNum+100; i++ {
+		err := db2.Put(utils.GetTestKey(i), utils.RandomValue(100))
+		assert.NoError(t, err)
+	}
+	assert.NoError(t, db2.Close())
+
+	db3, err := Open(options)
+	assert.NoError(t, err)
+	defer destroyDB(db3)
+	assert.Equal(t, keyNum+100, db3.Stat().KeysNum)
+	for i := 0; i < keyNum+100; i++ {
+		val, err := db3.Get(utils.GetTestKey(i))
 		assert.NoError(t, err)
 		assert.NotNil(t, val)
 	}
