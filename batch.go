@@ -2,11 +2,9 @@ package rosedb
 
 import (
 	"bytes"
-	"fmt"
 	"sync"
 	"time"
 
-	"github.com/bwmarrin/snowflake"
 	"github.com/rosedblabs/rosedb/v2/utils"
 	"github.com/valyala/bytebufferpool"
 )
@@ -41,7 +39,6 @@ type Batch struct {
 	mu               sync.RWMutex
 	committed        bool // whether the batch has been committed
 	rollbacked       bool // whether the batch has been rollbacked
-	batchId          *snowflake.Node
 	buffers          []*bytebufferpool.ByteBuffer
 }
 
@@ -53,25 +50,13 @@ func (db *DB) NewBatch(options BatchOptions) *Batch {
 		committed:  false,
 		rollbacked: false,
 	}
-	if !options.ReadOnly {
-		node, err := snowflake.NewNode(1)
-		if err != nil {
-			panic(fmt.Sprintf("snowflake.NewNode(1) failed: %v", err))
-		}
-		batch.batchId = node
-	}
 	batch.lock()
 	return batch
 }
 
 func newBatch() any {
-	node, err := snowflake.NewNode(1)
-	if err != nil {
-		panic(fmt.Sprintf("snowflake.NewNode(1) failed: %v", err))
-	}
 	return &Batch{
 		options: DefaultBatchOptions,
-		batchId: node,
 	}
 }
 
@@ -478,7 +463,7 @@ func (b *Batch) Commit() error {
 		return ErrBatchRollbacked
 	}
 
-	batchId := b.batchId.Generate()
+	batchId := b.db.txnIdGenerator.Generate()
 	now := time.Now().UnixNano()
 	// write to wal buffer
 	for _, record := range b.pendingWrites {
@@ -514,6 +499,10 @@ func (b *Batch) Commit() error {
 			return err
 		}
 	}
+
+	// The batch is now durably committed. Keep its id until its records are
+	// rewritten by a merge (merged records have a zero batch id).
+	b.db.committedTxns[uint64(batchId)] = struct{}{}
 
 	// write to index
 	for i, record := range b.pendingWrites {

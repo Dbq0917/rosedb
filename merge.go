@@ -130,8 +130,9 @@ func (db *DB) doMerge() error {
 		if record.Type == LogRecordNormal && (record.Expire == 0 || record.Expire > now) {
 			db.mu.RLock()
 			indexPos := db.index.Get(record.Key)
+			committed := record.BatchId == mergeFinishedBatchID || db.isCommittedTxn(record.BatchId)
 			db.mu.RUnlock()
-			if indexPos != nil && positionEquals(indexPos, position) {
+			if committed && indexPos != nil && positionEquals(indexPos, position) {
 				// clear the batch id of the record,
 				// all data after merge will be valid data, so the batch id should be 0.
 				record.BatchId = mergeFinishedBatchID
@@ -170,6 +171,13 @@ func (db *DB) doMerge() error {
 
 	// all done successfully, return nil
 	return nil
+}
+
+// isCommittedTxn reports whether the transaction id belongs to a batch that
+// has successfully committed. The caller must hold db.mu for reading.
+func (db *DB) isCommittedTxn(batchId uint64) bool {
+	_, ok := db.committedTxns[batchId]
+	return ok
 }
 
 func (db *DB) openMergeDB() (*DB, error) {

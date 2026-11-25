@@ -56,6 +56,13 @@ type DB struct {
 	watcher          *Watcher
 	expiredCursorKey []byte     // the location to which DeleteExpiredKeys executes.
 	cronScheduler    *cron.Cron // cron scheduler for auto merge task
+	txnIdGenerator   *snowflake.Node
+
+	// committedTxns stores the ids of committed batches (transactions).
+	// It is used to tell committed log records from records left behind by
+	// an incomplete batch. Entries are only needed while their log records
+	// are still present in the WAL, so the table is rebuilt after merge.
+	committedTxns map[uint64]struct{}
 }
 
 // Stat represents the statistics of the database.
@@ -102,14 +109,22 @@ func Open(options Options) (*DB, error) {
 		return nil, err
 	}
 
+	txnIdGenerator, err := snowflake.NewNode(1)
+	if err != nil {
+		_ = fileLock.Unlock()
+		return nil, err
+	}
+
 	// init DB instance
 	db := &DB{
-		index:        index.NewIndexer(),
-		options:      options,
-		fileLock:     fileLock,
-		batchPool:    sync.Pool{New: newBatch},
-		recordPool:   sync.Pool{New: newRecord},
-		encodeHeader: make([]byte, maxLogRecordHeaderSize),
+		index:          index.NewIndexer(),
+		options:        options,
+		fileLock:       fileLock,
+		batchPool:      sync.Pool{New: newBatch},
+		recordPool:     sync.Pool{New: newRecord},
+		encodeHeader:   make([]byte, maxLogRecordHeaderSize),
+		committedTxns:  make(map[uint64]struct{}),
+		txnIdGenerator: txnIdGenerator,
 	}
 
 	// open data files
@@ -169,6 +184,11 @@ func (db *DB) openWalFiles() (*wal.WAL, error) {
 }
 
 func (db *DB) loadIndex() error {
+	// All the transaction ids loaded here must come from the WAL files that
+	// are still present. Rebuilding the table from scratch is what reclaims
+	// ids whose data files have already been replaced by a merge.
+	db.committedTxns = make(map[uint64]struct{})
+
 	// load index from hint file
 	if err := db.loadIndexFromHintFile(); err != nil {
 		return err
@@ -707,6 +727,7 @@ func (db *DB) loadIndexFromWAL() error {
 			if err != nil {
 				return err
 			}
+			db.committedTxns[uint64(batchId)] = struct{}{}
 			for _, idxRecord := range indexRecords[uint64(batchId)] {
 				if idxRecord.recordType == LogRecordNormal {
 					db.index.Put(idxRecord.key, idxRecord.position)
